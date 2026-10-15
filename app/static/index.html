@@ -6,6 +6,9 @@
 <title>Research Map</title>
 <link rel="stylesheet" href="/static/styles.css">
 <script src="/static/vendor/cytoscape.min.js"></script>
+<script src="/static/vendor/layout-base.js"></script>
+<script src="/static/vendor/cose-base.js"></script>
+<script src="/static/vendor/cytoscape-fcose.js"></script>
 <script src="/static/vendor/marked.min.js"></script>
 <script src="/static/vendor/purify.min.js"></script>
 </head>
@@ -50,13 +53,14 @@
   <main class="canvas-wrap">
     <div class="canvas-toolbar">
       <select id="layout-select" title="Layout">
-        <option value="cose">Force-directed</option>
+        <option value="fcose">Auto (optimized)</option>
         <option value="concentric">Concentric (by type)</option>
         <option value="layered">Layered: drug → target → pathway → effect</option>
         <option value="circle">Circle</option>
         <option value="grid">Grid</option>
       </select>
       <button id="fit-btn">Fit</button>
+      <button id="arrange-btn" title="Re-optimize node positions from scratch">Re-arrange</button>
       <button id="add-node-btn">+ Node</button>
       <button id="add-edge-btn">+ Link</button>
       <span class="spacer"></span>

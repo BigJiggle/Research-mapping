@@ -109,6 +109,8 @@ function toast(msg, type = "", ms = 4000) {
 
 // ---------------------------------------------------------------- graph
 
+cytoscape.use(cytoscapeFcose);
+
 const cy = cytoscape({
   container: $("#cy"),
   wheelSensitivity: 0.3,
@@ -136,6 +138,7 @@ function graphStyle() {
     { selector: "node.focus", style: { "border-color": "#ffd166", "border-width": 4 } },
     { selector: "edge.focus", style: { "opacity": 1, "label": "data(label)" } },
     { selector: ".filtered", style: { "display": "none" } },
+    { selector: "node.new-node", style: { "border-color": "#ffd166", "border-width": 6 } },
     { selector: "node.link-source", style: { "border-color": "#ffd166", "border-width": 5 } },
   ];
   for (const [t, s] of Object.entries(TYPE_STYLE)) {
@@ -202,16 +205,46 @@ async function loadGraph({ relayout = false } = {}) {
   state.data = data;
   cy.elements().remove();
   cy.add(buildElements(data));
-  let newNodes = 0;
+  const added = cy.collection();
   cy.nodes().forEach((n) => {
     if (oldPositions[n.id()]) n.position(oldPositions[n.id()]);
-    else newNodes++;
+    else added.merge(n);
   });
   applyFilters();
   renderArticleList();
   $("#empty-state").classList.toggle("hidden", data.articles.length + data.entities.length > 0);
-  if (isNew || relayout || newNodes > 0) runLayout();
+  if (isNew || relayout) {
+    await runLayout({ fresh: true });
+  } else if (added.nonempty()) {
+    seedNewNodes(added);
+    await runLayout({ newNodes: added });
+  }
   if (state.selected) reselect();
+}
+
+/** Start each new node beside the already-placed nodes it connects to, so the optimizer only has local work to do. */
+function seedNewNodes(added) {
+  const placed = cy.nodes().not(added);
+  const bb = placed.nonempty() ? placed.boundingBox() : { x1: 0, y1: 0, x2: 0, y2: 0 };
+  const pending = added.toArray();
+  for (let pass = 0; pass < 3 && pending.length; pass++) {
+    for (let i = pending.length - 1; i >= 0; i--) {
+      const n = pending[i];
+      const anchors = n.neighborhood("node").filter((m) => !pending.includes(m));
+      if (anchors.empty() && pass < 2) continue;
+      let x, y;
+      if (anchors.nonempty()) {
+        x = anchors.reduce((s, m) => s + m.position("x"), 0) / anchors.length;
+        y = anchors.reduce((s, m) => s + m.position("y"), 0) / anchors.length;
+      } else {  // unconnected to anything placed: start just outside the current map
+        x = bb.x2 + 120;
+        y = (bb.y1 + bb.y2) / 2;
+      }
+      const a = Math.random() * 2 * Math.PI;
+      n.position({ x: x + Math.cos(a) * 60, y: y + Math.sin(a) * 60 });
+      pending.splice(i, 1);
+    }
+  }
 }
 
 function applyFilters() {
@@ -239,32 +272,167 @@ function applyFilters() {
   });
 }
 
-function runLayout() {
+// ----- layout engine
+
+const LAYOUT_ANIM_MS = 650;
+
+function fcoseOptions(randomize) {
+  const n = cy.nodes().filter((x) => !x.hasClass("filtered")).length;
+  return {
+    name: "fcose", quality: "proof", randomize, animate: false, fit: false,
+    nodeDimensionsIncludeLabels: true, packComponents: true, tile: true,
+    nodeSeparation: 90, uniformNodeDimensions: false,
+    idealEdgeLength: (e) => (e.data("kind") === "mention" ? 140 : 110),
+    edgeElasticity: (e) => (e.data("kind") === "mention" ? 0.2 : 0.45),
+    nodeRepulsion: () => 9000 + Math.min(20000, n * 120),
+    gravity: 0.25, gravityRange: 3.8, numIter: 5000,
+    tilingPaddingVertical: 30, tilingPaddingHorizontal: 30,
+  };
+}
+
+/** Run a layout without animation and return the resulting positions (restoring the current ones). */
+function computePositions(eles, opts) {
+  const before = {};
+  eles.nodes().forEach((n) => { before[n.id()] = { ...n.position() }; });
+  eles.layout(opts).run();
+  const after = {};
+  eles.nodes().forEach((n) => { after[n.id()] = { ...n.position() }; n.position(before[n.id()]); });
+  return after;
+}
+
+/** Lower is better: edge crossings, node/label overlaps, uneven edge lengths, and sprawl. */
+function scoreLayout(eles, pos) {
+  const nodes = eles.nodes().toArray();
+  const edges = eles.edges().toArray().filter((e) => pos[e.source().id()] && pos[e.target().id()]);
+  const P = (n) => pos[n.id()];
+  const ccw = (a, b, c) => (c.y - a.y) * (b.x - a.x) > (b.y - a.y) * (c.x - a.x);
+  let crossings = 0;
+  const cap = Math.min(edges.length, 600);
+  for (let i = 0; i < cap; i++) {
+    const a = P(edges[i].source()), b = P(edges[i].target());
+    for (let j = i + 1; j < cap; j++) {
+      const s = edges[j].source(), t = edges[j].target();
+      if ([s, t].some((x) => x === edges[i].source() || x === edges[i].target())) continue;
+      const c = P(s), d = P(t);
+      if (ccw(a, c, d) !== ccw(b, c, d) && ccw(a, b, c) !== ccw(a, b, d)) crossings++;
+    }
+  }
+  let overlaps = 0;
+  for (let i = 0; i < nodes.length; i++) {
+    const p = P(nodes[i]), wi = nodes[i].outerWidth() / 2 + 40;  // + label allowance
+    for (let j = i + 1; j < nodes.length; j++) {
+      const q = P(nodes[j]), wj = nodes[j].outerWidth() / 2 + 40;
+      if (Math.abs(p.x - q.x) < wi + wj - 30 && Math.abs(p.y - q.y) < (wi + wj) / 2) overlaps++;
+    }
+  }
+  const lens = edges.map((e) => Math.hypot(P(e.source()).x - P(e.target()).x, P(e.source()).y - P(e.target()).y));
+  const mean = lens.reduce((s, l) => s + l, 0) / (lens.length || 1);
+  const sd = Math.sqrt(lens.reduce((s, l) => s + (l - mean) ** 2, 0) / (lens.length || 1));
+  const xs = nodes.map((n) => P(n).x), ys = nodes.map((n) => P(n).y);
+  const area = nodes.length ? (Math.max(...xs) - Math.min(...xs) + 1) * (Math.max(...ys) - Math.min(...ys) + 1) : 0;
+  const sprawl = Math.sqrt(area / Math.max(1, nodes.length)) / 150;
+  return { total: crossings * 3 + overlaps * 5 + (sd / (mean || 1)) * 4 + sprawl, crossings, overlaps };
+}
+
+/** Layered view: columns by type, rows ordered by neighbour barycenters to cut crossings. */
+function layeredPositions(eles) {
+  const cols = {};
+  eles.nodes().forEach((n) => { const c = LAYER_COL[n.data("type")] ?? 3; (cols[c] = cols[c] || []).push(n); });
+  const keys = Object.keys(cols).map(Number).sort((a, b) => a - b);
+  const rank = {};
+  for (const k of keys) {
+    cols[k].sort((a, b) => a.data("label").localeCompare(b.data("label")));
+    cols[k].forEach((n, i) => { rank[n.id()] = i; });
+  }
+  const visible = (n) => n.neighborhood("node").filter((m) => eles.contains(m));
+  for (let sweep = 0; sweep < 8; sweep++) {
+    const order = sweep % 2 === 0 ? keys : [...keys].reverse();
+    for (const k of order) {
+      const bary = (n) => {
+        const nb = visible(n);
+        return nb.length ? nb.reduce((s, m) => s + rank[m.id()] / Math.max(1, cols[LAYER_COL[m.data("type")] ?? 3].length), 0) / nb.length : rank[n.id()] / cols[k].length;
+      };
+      const b = new Map(cols[k].map((n) => [n, bary(n)]));
+      cols[k].sort((x, y) => b.get(x) - b.get(y));
+      cols[k].forEach((n, i) => { rank[n.id()] = i; });
+    }
+  }
+  // transpose pass: swap neighbours in a column whenever that lowers the crossing score
+  const place = () => {
+    const pos = {};
+    for (const k of keys) cols[k].forEach((n, i) => { pos[n.id()] = { x: k * 260, y: (i - (cols[k].length - 1) / 2) * 70 }; });
+    return pos;
+  };
+  let best = scoreLayout(eles, place()).crossings;
+  for (let round = 0; round < 6; round++) {
+    let improved = false;
+    for (const k of keys) {
+      const col = cols[k];
+      for (let i = 0; i + 1 < col.length; i++) {
+        [col[i], col[i + 1]] = [col[i + 1], col[i]];
+        const c = scoreLayout(eles, place()).crossings;
+        if (c < best) { best = c; improved = true; } else { [col[i], col[i + 1]] = [col[i + 1], col[i]]; }
+      }
+    }
+    if (!improved) break;
+  }
+  return place();
+}
+
+function animateTo(eles, pos) {
+  return new Promise((resolve) => {
+    const l = eles.layout({ name: "preset", positions: (n) => pos[n.id()] || n.position(), animate: true,
+                            animationDuration: LAYOUT_ANIM_MS, fit: true, padding: 40 });
+    l.one("layoutstop", resolve);
+    l.run();
+  });
+}
+
+let layoutRunning = Promise.resolve();
+
+/**
+ * Re-optimize node positions.
+ *  fresh:    ignore current positions (first load, "Re-arrange", layout switch)
+ *  newNodes: nodes just added by an import - highlighted after the move
+ */
+function runLayout({ fresh = false, newNodes = null } = {}) {
+  layoutRunning = layoutRunning.then(() => doLayout(fresh, newNodes)).catch((e) => console.error("layout failed", e));
+  return layoutRunning;
+}
+
+async function doLayout(fresh, newNodes) {
   const name = $("#layout-select").value;
   const eles = cy.elements().filter((e) => !e.hasClass("filtered"));
-  let opts;
-  if (name === "cose") {
-    opts = { name: "cose", animate: true, animationDuration: 600, nodeRepulsion: () => 9000, idealEdgeLength: () => 90,
-             nodeOverlap: 20, gravity: 0.25, numIter: 1500, padding: 40 };
+  if (eles.nodes().empty()) return;
+  let pos;
+  if (name === "fcose") {
+    // Candidate 1 refines the current arrangement (keeps your mental map); candidate 2 starts from scratch.
+    // Keep whichever scores better, preferring the familiar one unless the fresh one is clearly better.
+    const candidates = [];
+    if (!fresh) candidates.push({ pos: computePositions(eles, fcoseOptions(false)), bias: 0.9 });
+    candidates.push({ pos: computePositions(eles, fcoseOptions(true)), bias: 1 });
+    if (fresh) candidates.push({ pos: computePositions(eles, fcoseOptions(true)), bias: 1 });
+    let best = null;
+    for (const c of candidates) {
+      c.score = scoreLayout(eles, c.pos);
+      if (!best || c.score.total * c.bias < best.score.total * best.bias) best = c;
+    }
+    state.layoutScore = best.score;
+    pos = best.pos;
+  } else if (name === "layered") {
+    pos = layeredPositions(eles);
   } else if (name === "concentric") {
     const order = { drug: 6, formulation: 5, target: 4, pathway: 3, effect: 2, disease: 1, other: 2, article: 0 };
-    opts = { name: "concentric", concentric: (n) => order[n.data("type")] ?? 0, levelWidth: () => 1, minNodeSpacing: 30, animate: true, padding: 40 };
-  } else if (name === "layered") {
-    const cols = {};
-    eles.nodes().forEach((n) => {
-      const c = LAYER_COL[n.data("type")] ?? 3;
-      (cols[c] = cols[c] || []).push(n);
-    });
-    const pos = {};
-    for (const [c, nodes] of Object.entries(cols)) {
-      nodes.sort((a, b) => a.data("label").localeCompare(b.data("label")));
-      nodes.forEach((n, i) => { pos[n.id()] = { x: Number(c) * 260, y: (i - nodes.length / 2) * 70 }; });
-    }
-    opts = { name: "preset", positions: (n) => pos[n.id()], animate: true, padding: 40 };
+    pos = computePositions(eles, { name: "concentric", concentric: (n) => order[n.data("type")] ?? 0, levelWidth: () => 1,
+                                   minNodeSpacing: 30, nodeDimensionsIncludeLabels: true, animate: false, fit: false });
   } else {
-    opts = { name, animate: true, padding: 40 };
+    pos = computePositions(eles, { name, animate: false, fit: false, avoidOverlap: true, nodeDimensionsIncludeLabels: true });
   }
-  eles.layout(opts).run();
+  await animateTo(eles, pos);
+  if (newNodes && newNodes.nonempty()) {
+    newNodes.addClass("new-node");
+    setTimeout(() => newNodes.removeClass("new-node"), 2500);
+  }
 }
 
 // ----- selection & focus
@@ -362,13 +530,14 @@ function renderArticleList() {
 }
 
 $("#show-articles").addEventListener("change", (e) => { state.showArticles = e.target.checked; applyFilters(); runLayout(); });
+$("#arrange-btn").addEventListener("click", () => runLayout({ fresh: true }));
 $("#hide-isolated").addEventListener("change", (e) => { state.hideIsolated = e.target.checked; applyFilters(); });
 $("#depth").addEventListener("input", (e) => {
   state.depth = Number(e.target.value);
   $("#depth-val").textContent = `${state.depth} hop${state.depth > 1 ? "s" : ""}`;
   if (state.selected) reselect();
 });
-$("#layout-select").addEventListener("change", runLayout);
+$("#layout-select").addEventListener("change", () => runLayout({ fresh: true }));
 $("#fit-btn").addEventListener("click", () => cy.animate({ fit: { eles: cy.elements().filter((e) => !e.hasClass("filtered")), padding: 40 } }, { duration: 300 }));
 
 let searchTimer;
