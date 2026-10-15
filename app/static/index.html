@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Research Map</title>
+<link rel="stylesheet" href="/static/styles.css">
+<script src="/static/vendor/cytoscape.min.js"></script>
+<script src="/static/vendor/marked.min.js"></script>
+<script src="/static/vendor/purify.min.js"></script>
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">Research Map</div>
+  <form id="add-form" class="add-form">
+    <textarea id="add-input" rows="1" placeholder="Paste PMIDs, PubMed / PMC / DOI / arXiv / bioRxiv links or any article URL (one per line)"></textarea>
+    <button type="submit" class="primary" id="add-btn">Add to map</button>
+    <button type="button" id="more-btn" title="Paste text or upload a PDF">More…</button>
+  </form>
+  <label class="toggle" title="Use Claude to extract drugs, targets, pathways and how they connect"><input type="checkbox" id="use-ai" checked> AI extraction</label>
+  <span id="ai-status" class="pill">AI: checking…</span>
+</header>
+
+<div class="layout">
+  <aside class="sidebar">
+    <section>
+      <h3>Search</h3>
+      <input id="search" type="search" placeholder="Find a drug, target, pathway…">
+    </section>
+    <section>
+      <h3>Show</h3>
+      <div id="type-filters" class="filters"></div>
+      <label class="check"><input type="checkbox" id="show-articles"> Article nodes</label>
+      <label class="check"><input type="checkbox" id="hide-isolated"> Hide unconnected</label>
+    </section>
+    <section>
+      <h3>Relations</h3>
+      <div id="rel-legend" class="legend"></div>
+    </section>
+    <section>
+      <h3>Focus depth</h3>
+      <input type="range" id="depth" min="1" max="4" value="2"> <span id="depth-val">2 hops</span>
+    </section>
+    <section class="grow">
+      <h3>Articles <span id="article-count" class="muted"></span></h3>
+      <ul id="article-list" class="article-list"></ul>
+    </section>
+  </aside>
+
+  <main class="canvas-wrap">
+    <div class="canvas-toolbar">
+      <select id="layout-select" title="Layout">
+        <option value="cose">Force-directed</option>
+        <option value="concentric">Concentric (by type)</option>
+        <option value="layered">Layered: drug → target → pathway → effect</option>
+        <option value="circle">Circle</option>
+        <option value="grid">Grid</option>
+      </select>
+      <button id="fit-btn">Fit</button>
+      <button id="add-node-btn">+ Node</button>
+      <button id="add-edge-btn">+ Link</button>
+      <span class="spacer"></span>
+      <button id="png-btn">PNG</button>
+      <button id="export-btn">Export</button>
+      <button id="import-btn">Import</button>
+      <input type="file" id="import-file" accept="application/json" hidden>
+    </div>
+    <div id="cy"></div>
+    <div id="empty-state" class="empty-state hidden">
+      <h2>Map research into pathways</h2>
+      <p>Paste a PubMed ID (e.g. <code>23746838</code>), a PubMed / DOI / arXiv link, or upload a PDF.</p>
+      <p>Claude reads each article and adds the drugs, targets, pathways and effects it describes, plus <em>how</em> they act on each other.</p>
+    </div>
+    <div id="link-hint" class="hint hidden">Click the <b>source</b> node, then the <b>target</b> node. <a href="#" id="cancel-link">Cancel</a></div>
+    <div id="toast" class="toast hidden"></div>
+  </main>
+
+  <aside class="panel">
+    <nav class="tabs">
+      <button data-tab="details" class="active">Details</button>
+      <button data-tab="chat">Ask AI</button>
+      <button data-tab="calc">Dose calc</button>
+    </nav>
+    <section id="tab-details" class="tab active">
+      <div id="details" class="details"><p class="muted">Click a node or link in the map to see details.</p></div>
+    </section>
+    <section id="tab-chat" class="tab">
+      <div class="chat-controls">
+        <div id="modes" class="chips">
+          <button data-mode="" class="chip active">General</button>
+          <button data-mode="pathway" class="chip">Pathway</button>
+          <button data-mode="drug" class="chip">Drug</button>
+          <button data-mode="formulation" class="chip">Formulation</button>
+          <button data-mode="dose" class="chip">Dose calc</button>
+        </div>
+        <div class="row">
+          <span id="focus-chip" class="focus-chip hidden"></span>
+          <span class="spacer"></span>
+          <label class="check small"><input type="checkbox" id="web-search"> Web search</label>
+          <button id="clear-chat" class="link">Clear</button>
+        </div>
+      </div>
+      <div id="chat-log" class="chat-log">
+        <div class="msg system">Ask about anything in your map — a pathway, a research drug, a formulation, or a dose calculation. Select a node first to focus the question on it.</div>
+      </div>
+      <form id="chat-form" class="chat-form">
+        <textarea id="chat-input" rows="2" placeholder="e.g. How does rapamycin act on mTOR signaling in these studies?"></textarea>
+        <button type="submit" class="primary" id="chat-send">Send</button>
+      </form>
+    </section>
+    <section id="tab-calc" class="tab">
+      <div id="calc"></div>
+      <p class="disclaimer">For research planning and education only. Not medical advice; verify every calculation before use.</p>
+    </section>
+  </aside>
+</div>
+
+<dialog id="more-dialog">
+  <form method="dialog" class="dialog-body" id="text-form">
+    <h3>Add from text or PDF</h3>
+    <label>Upload PDF<input type="file" id="pdf-file" accept="application/pdf"></label>
+    <div class="or">— or paste text —</div>
+    <label>Title<input id="text-title" placeholder="Article title"></label>
+    <label>Link (optional)<input id="text-url" placeholder="https://…"></label>
+    <label>Abstract or full text<textarea id="text-body" rows="8"></textarea></label>
+    <div class="row end">
+      <button value="cancel">Cancel</button>
+      <button id="text-submit" class="primary" value="default">Add</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="node-dialog">
+  <form method="dialog" class="dialog-body">
+    <h3>Add node</h3>
+    <label>Name<input id="node-name" required></label>
+    <label>Type<select id="node-type"></select></label>
+    <label>Note<input id="node-info" placeholder="optional"></label>
+    <div class="row end"><button value="cancel">Cancel</button><button class="primary" value="ok">Add</button></div>
+  </form>
+</dialog>
+
+<dialog id="edge-dialog">
+  <form method="dialog" class="dialog-body">
+    <h3>Add link</h3>
+    <p id="edge-desc" class="muted"></p>
+    <label>Relation<select id="edge-rel"></select></label>
+    <label>Mechanism<input id="edge-mech" placeholder="how it acts (optional)"></label>
+    <label>Dose<input id="edge-dose" placeholder="optional"></label>
+    <div class="row end"><button value="cancel">Cancel</button><button class="primary" value="ok">Add</button></div>
+  </form>
+</dialog>
+
+<dialog id="merge-dialog">
+  <form method="dialog" class="dialog-body">
+    <h3>Merge duplicate</h3>
+    <p class="muted">Fold another node into <b id="merge-keep"></b>. Its links and articles move over and its name becomes an alias.</p>
+    <label>Node to merge in<input id="merge-search" placeholder="Search…" autocomplete="off"></label>
+    <ul id="merge-results" class="pick-list"></ul>
+    <div class="row end"><button value="cancel">Cancel</button></div>
+  </form>
+</dialog>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
