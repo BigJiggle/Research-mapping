@@ -57,6 +57,8 @@ const relLabel = (r) => r.replace(/_/g, " ");
 const isDark = () => matchMedia("(prefers-color-scheme: dark)").matches;
 
 async function api(path, opts = {}) {
+  // The iPad / browser-only build supplies an in-page backend instead of the Python server.
+  if (window.LocalBackend) return window.LocalBackend.api(path, opts);
   const res = await fetch(path, {
     headers: opts.body && !(opts.body instanceof FormData) ? { "Content-Type": "application/json" } : {},
     ...opts,
@@ -71,6 +73,7 @@ async function api(path, opts = {}) {
 
 /** POST and consume a text/event-stream response, calling onEvent(event, data). */
 async function streamSSE(path, body, onEvent) {
+  if (window.LocalBackend) return window.LocalBackend.stream(path, body, onEvent);
   const res = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body || {}) });
   if (!res.ok) {
     let msg = `Request failed (${res.status})`;
@@ -329,13 +332,25 @@ function scoreLayout(eles, pos) {
       if (Math.abs(p.x - q.x) < wi + wj - 30 && Math.abs(p.y - q.y) < (wi + wj) / 2) overlaps++;
     }
   }
+  // edges that run straight through a node they don't belong to
+  let throughNodes = 0;
+  for (const e of edges) {
+    const a = P(e.source()), b = P(e.target());
+    const dx = b.x - a.x, dy = b.y - a.y, L2 = dx * dx + dy * dy || 1;
+    for (const n of nodes) {
+      if (n === e.source() || n === e.target()) continue;
+      const c = P(n);
+      const t = Math.max(0, Math.min(1, ((c.x - a.x) * dx + (c.y - a.y) * dy) / L2));
+      if (Math.hypot(a.x + t * dx - c.x, a.y + t * dy - c.y) < n.outerWidth() / 2 + 6) throughNodes++;
+    }
+  }
   const lens = edges.map((e) => Math.hypot(P(e.source()).x - P(e.target()).x, P(e.source()).y - P(e.target()).y));
   const mean = lens.reduce((s, l) => s + l, 0) / (lens.length || 1);
   const sd = Math.sqrt(lens.reduce((s, l) => s + (l - mean) ** 2, 0) / (lens.length || 1));
   const xs = nodes.map((n) => P(n).x), ys = nodes.map((n) => P(n).y);
   const area = nodes.length ? (Math.max(...xs) - Math.min(...xs) + 1) * (Math.max(...ys) - Math.min(...ys) + 1) : 0;
   const sprawl = Math.sqrt(area / Math.max(1, nodes.length)) / 150;
-  return { total: crossings * 3 + overlaps * 5 + (sd / (mean || 1)) * 4 + sprawl, crossings, overlaps };
+  return { total: crossings * 3 + overlaps * 5 + throughNodes * 4 + (sd / (mean || 1)) * 4 + sprawl, crossings, overlaps, throughNodes };
 }
 
 /** Layered view: columns by type, rows ordered by neighbour barycenters to cut crossings. */
@@ -402,10 +417,13 @@ function radialPositions(eles, keepOrder = false) {
   });
 
   let angle = new Map();
-  const spread = (ring, offset = 0) => ring.forEach((n, i) => angle.set(n.id(), offset - Math.PI / 2 + (2 * Math.PI * i) / ring.length));
+  // small rings sit in an arc (a pair spread 180° apart would send their link straight through the centre)
+  const stepOf = (ring) => (ring.length <= 3 ? Math.min((2 * Math.PI) / ring.length, Math.PI / 2) : (2 * Math.PI) / ring.length);
+  const spread = (ring, offset = 0) => ring.forEach((n, i) => angle.set(n.id(), offset - Math.PI / 2 + stepOf(ring) * i));
 
   const circMean = (as) => Math.atan2(as.reduce((s, a) => s + Math.sin(a), 0), as.reduce((s, a) => s + Math.cos(a), 0));
-  const neighbourAngles = (n) => n.neighborhood("node").filter((m) => eles.contains(m) && ringOf.get(m.id()) !== ringOf.get(n.id()))
+  const neighbourAngles = (n) => n.neighborhood("node")
+    .filter((m) => eles.contains(m) && ringOf.get(m.id()) !== ringOf.get(n.id()) && radii[ringOf.get(m.id())] > 0)  // a lone centre node has no direction
     .map((m) => angle.get(m.id()));
 
   const place = () => {
@@ -420,7 +438,8 @@ function radialPositions(eles, keepOrder = false) {
   // several starting orders (alphabetical + seeded shuffles); keep the arrangement with the fewest crossings
   let seed = 7;
   const rand = () => ((seed = (seed * 16807) % 2147483647) / 2147483647);
-  const restarts = eles.edges().length <= 150 ? 10 : eles.edges().length <= 400 ? 4 : 1;
+  const E = eles.edges().length;
+  const restarts = E <= 30 ? 10 : E <= 80 ? 4 : E <= 200 ? 2 : 1;  // keep re-arranging under ~1 s, even on an iPad
   let bestPos = null, bestScore = Infinity;
   // attempt -1 starts from the current on-screen order, and wins ties so imports don't reshuffle the rings
   const curAngle = (n) => Math.atan2(n.position("y"), n.position("x"));
@@ -430,11 +449,11 @@ function radialPositions(eles, keepOrder = false) {
       if (attempt === -1) ring.sort((a, b) => curAngle(a) - curAngle(b));
       else ring.sort((a, b) => a.data("label").localeCompare(b.data("label")));
       if (attempt > 0) for (let k = ring.length - 1; k > 0; k--) { const j = Math.floor(rand() * (k + 1)); [ring[k], ring[j]] = [ring[j], ring[k]]; }
-      spread(ring);
+      spread(ring, attempt > 0 ? rand() * 2 * Math.PI : 0);
     });
     const pos = optimiseRings();
     const sc = scoreLayout(eles, pos);
-    const total = (sc.crossings * 3 + sc.overlaps * 5) * (attempt === -1 ? 0.85 : 1);
+    const total = (sc.crossings * 3 + sc.overlaps * 5 + sc.throughNodes * 4) * (attempt === -1 ? 0.85 : 1);
     if (total < bestScore) { bestScore = total; bestPos = pos; }
   }
   return bestPos;
@@ -453,14 +472,15 @@ function radialPositions(eles, keepOrder = false) {
       const norm = (a) => ((a % (2 * Math.PI)) + 2 * Math.PI) % (2 * Math.PI);
       ring.sort((a, b) => norm(target.get(a) + Math.PI / 2) - norm(target.get(b) + Math.PI / 2));
       // rotate the evenly spaced slots so they line up with where the nodes want to be
-      const offset = circMean(ring.map((n, k) => target.get(n) - (-Math.PI / 2 + (2 * Math.PI * k) / ring.length)));
+      const offset = circMean(ring.map((n, k) => target.get(n) - (-Math.PI / 2 + stepOf(ring) * k)));
       spread(ring, offset);
     }
   }
 
   // transpose pass: swap angular neighbours whenever it removes crossings (skipped on very large maps)
   if (eles.edges().length <= 400) {
-    let best = scoreLayout(eles, place()).crossings;
+    const cost = () => { const sc = scoreLayout(eles, place()); return sc.crossings * 3 + sc.throughNodes * 4; };
+    let best = cost();
     for (let round = 0; round < 4 && best > 0; round++) {
       let improved = false;
       for (const ring of rings) {
@@ -468,7 +488,7 @@ function radialPositions(eles, keepOrder = false) {
           const a = ring[k], b = ring[(k + 1) % ring.length];
           const [ta, tb] = [angle.get(a.id()), angle.get(b.id())];
           angle.set(a.id(), tb); angle.set(b.id(), ta);
-          const c = scoreLayout(eles, place()).crossings;
+          const c = cost();
           if (c < best) { best = c; improved = true; [ring[k], ring[(k + 1) % ring.length]] = [b, a]; }
           else { angle.set(a.id(), ta); angle.set(b.id(), tb); }
         }
@@ -1257,9 +1277,9 @@ async function boot() {
     const s = await api("/api/status");
     state.aiReady = s.ai.configured;
     const pill = $("#ai-status");
-    pill.textContent = s.ai.configured ? `AI: ${s.ai.model}` : "AI: no API key";
+    pill.textContent = s.ai.configured ? `AI: ${s.ai.model}` : s.ai.label || "AI: no API key";
     pill.className = "pill " + (s.ai.configured ? "ok" : "bad");
-    pill.title = s.ai.configured ? "Claude is configured" : "Set ANTHROPIC_API_KEY and restart to enable AI extraction, descriptions and chat";
+    pill.title = s.ai.configured ? "Claude is configured" : s.ai.hint || "Set ANTHROPIC_API_KEY and restart to enable AI extraction, descriptions and chat";
   } catch {}
   await loadGraph();
 }

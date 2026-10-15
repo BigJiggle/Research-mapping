@@ -1,0 +1,31 @@
+/* iPad / touch adjustments layered on top of app/static/styles.css */
+html { -webkit-text-size-adjust: 100%; }
+body {
+  padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+  overscroll-behavior: none;
+}
+button, select, input { min-height: 34px; }
+#cy { touch-action: none; }  /* let the graph own pinch / pan gestures */
+.legend-item, .check, .article-list li { min-height: 28px; }
+.small-note { font-size: 12px; margin: 0; }
+#filters-btn { display: none; }
+
+/* Narrower than a landscape iPad: sidebar becomes a slide-over drawer */
+@media (max-width: 1180px) {
+  #filters-btn { display: inline-block; }
+  .layout { grid-template-columns: 1fr 360px; }
+  .sidebar {
+    position: fixed; top: 0; bottom: 0; left: 0; width: 280px; z-index: 50;
+    padding-top: calc(env(safe-area-inset-top) + 12px);
+    transform: translateX(-105%); transition: transform .2s ease; box-shadow: 0 0 24px rgba(0, 0, 0, .25);
+  }
+  body.sidebar-open .sidebar { transform: none; }
+}
+/* Portrait iPad / phone: map above, panel below */
+@media (max-width: 900px) {
+  .layout { grid-template-columns: 1fr; grid-template-rows: 58vh auto; }
+  .panel { border-left: none; border-top: 1px solid var(--border); min-height: 60vh; }
+  .sidebar { max-height: none; border-bottom: none; }
+  .topbar { flex-wrap: wrap; }
+  .add-form { order: 10; flex-basis: 100%; }
+}
