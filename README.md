@@ -16,7 +16,7 @@ A local web app for mapping research articles onto an interactive graph of **dru
 - **Interactive map** (Cytoscape.js):
   - Click a node to highlight its neighbourhood (1–4 hops) and open its details.
   - Click a link to see every supporting article and its mechanism.
-  - Filter by entity type or relation type, search, and switch layouts (auto-optimized, concentric, layered drug → target → pathway → effect).
+  - Filter by entity type or relation type, search, and switch layouts. The default is **circular rings**: drugs at the centre, then targets, pathways, and effects/diseases on the outer ring, with faint guide circles. Each ring is ordered to minimise crossing links. Auto-optimized (free-form), layered, circle and grid are also available.
   - **Auto-arranging on every import**:
     - New nodes start next to the nodes they connect to. Then the whole map is re-optimized with the fcose force layout, which accounts for label sizes.
     - Two candidate arrangements (refine the current one, or start fresh) are scored on edge crossings, overlapping nodes/labels, uneven edge lengths and spread. The better one is animated in, with a small preference for keeping your current arrangement.

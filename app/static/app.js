@@ -138,6 +138,10 @@ function graphStyle() {
     { selector: "node.focus", style: { "border-color": "#ffd166", "border-width": 4 } },
     { selector: "edge.focus", style: { "opacity": 1, "label": "data(label)" } },
     { selector: ".filtered", style: { "display": "none" } },
+    { selector: "node.ring-guide", style: {
+      "background-opacity": 0, "border-width": 1.5, "border-style": "dashed", "border-color": isDark() ? "#3a4352" : "#cfd5de",
+      "label": "", "events": "no", "z-index": 0, "z-compound-depth": "bottom", "width": "data(size)", "height": "data(size)", "shape": "ellipse",
+    } },
     { selector: "node.new-node", style: { "border-color": "#ffd166", "border-width": 6 } },
     { selector: "node.link-source", style: { "border-color": "#ffd166", "border-width": 5 } },
   ];
@@ -224,7 +228,7 @@ async function loadGraph({ relayout = false } = {}) {
 
 /** Start each new node beside the already-placed nodes it connects to, so the optimizer only has local work to do. */
 function seedNewNodes(added) {
-  const placed = cy.nodes().not(added);
+  const placed = cy.nodes().not(added).not(".ring-guide");
   const bb = placed.nonempty() ? placed.boundingBox() : { x1: 0, y1: 0, x2: 0, y2: 0 };
   const pending = added.toArray();
   for (let pass = 0; pass < 3 && pending.length; pass++) {
@@ -261,7 +265,7 @@ function applyFilters() {
     });
     if (state.hideIsolated) {
       cy.nodes().forEach((n) => {
-        if (n.hasClass("filtered") || n.data("type") === "article") return;
+        if (n.hasClass("filtered") || n.hasClass("ring-guide") || n.data("type") === "article") return;
         const visibleEdges = n.connectedEdges().filter((e) => !e.hasClass("filtered"));
         if (visibleEdges.length === 0) n.addClass("filtered");
       });
@@ -379,6 +383,120 @@ function layeredPositions(eles) {
   return place();
 }
 
+/** Circular view: concentric rings by type (drugs inside, outcomes outside), each ring ordered to cut crossings. */
+const RING = { drug: 0, formulation: 0, target: 1, pathway: 2, other: 2, effect: 3, disease: 3, article: 4 };
+const RING_GAP = 170, MIN_ARC = 95;
+
+function radialPositions(eles, keepOrder = false) {
+  const byRing = {};
+  eles.nodes().forEach((n) => { const r = RING[n.data("type")] ?? 2; (byRing[r] = byRing[r] || []).push(n); });
+  const rings = Object.keys(byRing).map(Number).sort((a, b) => a - b).map((r) => byRing[r]);
+  const ringOf = new Map();
+  rings.forEach((ring, i) => ring.forEach((n) => ringOf.set(n.id(), i)));
+
+  // radii: each ring big enough for its nodes, and clear of the ring inside it
+  const radii = [];
+  rings.forEach((ring, i) => {
+    const needed = (ring.length * MIN_ARC) / (2 * Math.PI);
+    radii.push(i === 0 ? (ring.length === 1 ? 0 : Math.max(110, needed)) : Math.max(radii[i - 1] + RING_GAP, needed));
+  });
+
+  let angle = new Map();
+  const spread = (ring, offset = 0) => ring.forEach((n, i) => angle.set(n.id(), offset - Math.PI / 2 + (2 * Math.PI * i) / ring.length));
+
+  const circMean = (as) => Math.atan2(as.reduce((s, a) => s + Math.sin(a), 0), as.reduce((s, a) => s + Math.cos(a), 0));
+  const neighbourAngles = (n) => n.neighborhood("node").filter((m) => eles.contains(m) && ringOf.get(m.id()) !== ringOf.get(n.id()))
+    .map((m) => angle.get(m.id()));
+
+  const place = () => {
+    const pos = {};
+    rings.forEach((ring, i) => ring.forEach((n) => {
+      const a = angle.get(n.id());
+      pos[n.id()] = { x: radii[i] * Math.cos(a), y: radii[i] * Math.sin(a) };
+    }));
+    return pos;
+  };
+
+  // several starting orders (alphabetical + seeded shuffles); keep the arrangement with the fewest crossings
+  let seed = 7;
+  const rand = () => ((seed = (seed * 16807) % 2147483647) / 2147483647);
+  const restarts = eles.edges().length <= 150 ? 10 : eles.edges().length <= 400 ? 4 : 1;
+  let bestPos = null, bestScore = Infinity;
+  // attempt -1 starts from the current on-screen order, and wins ties so imports don't reshuffle the rings
+  const curAngle = (n) => Math.atan2(n.position("y"), n.position("x"));
+  for (let attempt = keepOrder ? -1 : 0; attempt < restarts; attempt++) {
+    angle = new Map();
+    rings.forEach((ring) => {
+      if (attempt === -1) ring.sort((a, b) => curAngle(a) - curAngle(b));
+      else ring.sort((a, b) => a.data("label").localeCompare(b.data("label")));
+      if (attempt > 0) for (let k = ring.length - 1; k > 0; k--) { const j = Math.floor(rand() * (k + 1)); [ring[k], ring[j]] = [ring[j], ring[k]]; }
+      spread(ring);
+    });
+    const pos = optimiseRings();
+    const sc = scoreLayout(eles, pos);
+    const total = (sc.crossings * 3 + sc.overlaps * 5) * (attempt === -1 ? 0.85 : 1);
+    if (total < bestScore) { bestScore = total; bestPos = pos; }
+  }
+  return bestPos;
+
+  function optimiseRings() {
+  // barycentric sweeps: pull each node toward the angular mean of its neighbours in other rings
+  const order = rings.map((_, i) => i);
+  for (let sweep = 0; sweep < 8; sweep++) {
+    for (const i of sweep % 2 === 0 ? order : [...order].reverse()) {
+      const ring = rings[i];
+      if (ring.length < 2) continue;
+      const target = new Map(ring.map((n) => {
+        const nb = neighbourAngles(n);
+        return [n, nb.length ? circMean(nb) : angle.get(n.id())];
+      }));
+      const norm = (a) => ((a % (2 * Math.PI)) + 2 * Math.PI) % (2 * Math.PI);
+      ring.sort((a, b) => norm(target.get(a) + Math.PI / 2) - norm(target.get(b) + Math.PI / 2));
+      // rotate the evenly spaced slots so they line up with where the nodes want to be
+      const offset = circMean(ring.map((n, k) => target.get(n) - (-Math.PI / 2 + (2 * Math.PI * k) / ring.length)));
+      spread(ring, offset);
+    }
+  }
+
+  // transpose pass: swap angular neighbours whenever it removes crossings (skipped on very large maps)
+  if (eles.edges().length <= 400) {
+    let best = scoreLayout(eles, place()).crossings;
+    for (let round = 0; round < 4 && best > 0; round++) {
+      let improved = false;
+      for (const ring of rings) {
+        for (let k = 0; k < ring.length && ring.length > 2; k++) {
+          const a = ring[k], b = ring[(k + 1) % ring.length];
+          const [ta, tb] = [angle.get(a.id()), angle.get(b.id())];
+          angle.set(a.id(), tb); angle.set(b.id(), ta);
+          const c = scoreLayout(eles, place()).crossings;
+          if (c < best) { best = c; improved = true; [ring[k], ring[(k + 1) % ring.length]] = [b, a]; }
+          else { angle.set(a.id(), ta); angle.set(b.id(), tb); }
+        }
+      }
+      if (!improved) break;
+    }
+  }
+  return place();
+  }
+}
+
+/** Faint guide circles behind the circular view so the ring structure reads at a glance. */
+function drawRingGuides(eles, pos) {
+  cy.remove(".ring-guide");
+  if (!pos) return;
+  const radii = new Map();
+  eles.nodes().forEach((n) => {
+    const p = pos[n.id()];
+    if (!p) return;
+    const r = Math.round(Math.hypot(p.x, p.y));
+    if (r > 5) radii.set(RING[n.data("type")] ?? 2, r);
+  });
+  cy.add([...new Set(radii.values())].map((r) => ({
+    group: "nodes", classes: "ring-guide", data: { id: `ring-${r}`, size: 2 * r, kind: "guide" },
+    position: { x: 0, y: 0 }, selectable: false, grabbable: false, locked: true,
+  })));
+}
+
 function animateTo(eles, pos) {
   return new Promise((resolve) => {
     const l = eles.layout({ name: "preset", positions: (n) => pos[n.id()] || n.position(), animate: true,
@@ -402,8 +520,9 @@ function runLayout({ fresh = false, newNodes = null } = {}) {
 
 async function doLayout(fresh, newNodes) {
   const name = $("#layout-select").value;
-  const eles = cy.elements().filter((e) => !e.hasClass("filtered"));
+  const eles = cy.elements().filter((e) => !e.hasClass("filtered") && !e.hasClass("ring-guide"));
   if (eles.nodes().empty()) return;
+  if (name !== "radial") cy.remove(".ring-guide");
   let pos;
   if (name === "fcose") {
     // Candidate 1 refines the current arrangement (keeps your mental map); candidate 2 starts from scratch.
@@ -421,10 +540,9 @@ async function doLayout(fresh, newNodes) {
     pos = best.pos;
   } else if (name === "layered") {
     pos = layeredPositions(eles);
-  } else if (name === "concentric") {
-    const order = { drug: 6, formulation: 5, target: 4, pathway: 3, effect: 2, disease: 1, other: 2, article: 0 };
-    pos = computePositions(eles, { name: "concentric", concentric: (n) => order[n.data("type")] ?? 0, levelWidth: () => 1,
-                                   minNodeSpacing: 30, nodeDimensionsIncludeLabels: true, animate: false, fit: false });
+  } else if (name === "radial") {
+    pos = radialPositions(eles, !fresh);
+    drawRingGuides(eles, pos);
   } else {
     pos = computePositions(eles, { name, animate: false, fit: false, avoidOverlap: true, nodeDimensionsIncludeLabels: true });
   }
